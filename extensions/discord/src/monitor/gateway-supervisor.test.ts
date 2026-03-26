@@ -24,12 +24,35 @@ describe("classifyDiscordGatewayEvent", () => {
       isDisallowedIntentsError: () => false,
     });
 
+    // Without the intentional-abort flag, reconnect errors are still reconnect-exhausted.
     expect(reconnectEvent.type).toBe("reconnect-exhausted");
     expect(reconnectEvent.shouldStopLifecycle).toBe(true);
     expect(fatalEvent.type).toBe("fatal");
     expect(disallowedEvent.type).toBe("disallowed-intents");
     expect(transientEvent.type).toBe("other");
     expect(transientEvent.shouldStopLifecycle).toBe(false);
+  });
+
+  it("treats a reconnect event as reconnect-aborted when isIntentionalAbort is set", () => {
+    const abortedEvent = classifyDiscordGatewayEvent({
+      err: new Error("Max reconnect attempts (0) reached after code 1005"),
+      isDisallowedIntentsError: () => false,
+      isIntentionalAbort: true,
+    });
+
+    expect(abortedEvent.type).toBe("reconnect-aborted");
+    expect(abortedEvent.shouldStopLifecycle).toBe(false);
+  });
+
+  it("treats genuine reconnect exhaustion as lifecycle-stopping regardless of the flag", () => {
+    const exhaustedEvent = classifyDiscordGatewayEvent({
+      err: new Error("Max reconnect attempts (5) reached after code 1006"),
+      isDisallowedIntentsError: () => false,
+      isIntentionalAbort: false,
+    });
+
+    expect(exhaustedEvent.type).toBe("reconnect-exhausted");
+    expect(exhaustedEvent.shouldStopLifecycle).toBe(true);
   });
 });
 
@@ -40,9 +63,7 @@ describe("createDiscordGatewaySupervisor", () => {
       error: vi.fn(),
     };
     const supervisor = createDiscordGatewaySupervisor({
-      client: {
-        getPlugin: vi.fn(() => ({ emitter })),
-      } as never,
+      gateway: { emitter },
       isDisallowedIntentsError: (err) => String(err).includes("4014"),
       runtime: runtime as never,
     });
@@ -70,11 +91,51 @@ describe("createDiscordGatewaySupervisor", () => {
     );
   });
 
+  it("classifies a reconnect event as reconnect-aborted after markIntentionalAbort", () => {
+    const emitter = new EventEmitter();
+    const runtime = { error: vi.fn() };
+    const supervisor = createDiscordGatewaySupervisor({
+      gateway: { emitter },
+      isDisallowedIntentsError: () => false,
+      runtime: runtime as never,
+    });
+    const seen: Array<{ type: string; shouldStopLifecycle: boolean }> = [];
+
+    supervisor.attachLifecycle((event) => {
+      seen.push({ type: event.type, shouldStopLifecycle: event.shouldStopLifecycle });
+    });
+
+    // Simulate health-monitor abort: mark first, then disconnect triggers the error.
+    supervisor.markIntentionalAbort();
+    emitter.emit("error", new Error("Max reconnect attempts (0) reached after code 1005"));
+
+    expect(seen).toEqual([{ type: "reconnect-aborted", shouldStopLifecycle: false }]);
+
+    // Flag is consumed — a subsequent reconnect error is treated as real exhaustion.
+    emitter.emit("error", new Error("Max reconnect attempts (5) reached after code 1006"));
+    expect(seen[1]).toEqual({ type: "reconnect-exhausted", shouldStopLifecycle: true });
+  });
+
+  it("logs late errors after dispose with 'after dispose' message", () => {
+    const emitter = new EventEmitter();
+    const runtime = { error: vi.fn() };
+    const supervisor = createDiscordGatewaySupervisor({
+      gateway: { emitter },
+      isDisallowedIntentsError: () => false,
+      runtime: runtime as never,
+    });
+
+    supervisor.dispose();
+    emitter.emit("error", new Error("Max reconnect attempts (0) reached after code 1005"));
+
+    expect(runtime.error).toHaveBeenCalledWith(
+      expect.stringContaining("suppressed late gateway reconnect-exhausted error after dispose"),
+    );
+  });
+
   it("is idempotent on dispose and noops without an emitter", () => {
     const supervisor = createDiscordGatewaySupervisor({
-      client: {
-        getPlugin: vi.fn(() => undefined),
-      } as never,
+      gateway: undefined,
       isDisallowedIntentsError: () => false,
       runtime: { error: vi.fn() } as never,
     });
@@ -84,5 +145,6 @@ describe("createDiscordGatewaySupervisor", () => {
     expect(() => supervisor.detachLifecycle()).not.toThrow();
     expect(() => supervisor.dispose()).not.toThrow();
     expect(() => supervisor.dispose()).not.toThrow();
+    expect(() => supervisor.markIntentionalAbort()).not.toThrow();
   });
 });

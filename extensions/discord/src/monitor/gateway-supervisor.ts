@@ -1,5 +1,4 @@
 import type { EventEmitter } from "node:events";
-import type { Client } from "@buape/carbon";
 import { danger } from "openclaw/plugin-sdk/runtime-env";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
 import { getDiscordGatewayEmitter } from "../monitor.gateway.js";
@@ -8,6 +7,7 @@ export type DiscordGatewayEventType =
   | "disallowed-intents"
   | "fatal"
   | "other"
+  | "reconnect-aborted"
   | "reconnect-exhausted";
 
 export type DiscordGatewayEvent = {
@@ -25,6 +25,12 @@ export type DiscordGatewaySupervisor = {
     handler: (event: DiscordGatewayEvent) => "continue" | "stop",
   ) => "continue" | "stop";
   dispose: () => void;
+  /**
+   * Call this before triggering an intentional gateway abort (e.g. from the
+   * health-monitor onAbort path). Marks the next reconnect-exhausted event as
+   * reconnect-aborted so it does not stop the lifecycle.
+   */
+  markIntentionalAbort: () => void;
 };
 
 type GatewaySupervisorPhase = "active" | "buffering" | "disposed" | "teardown";
@@ -32,6 +38,7 @@ type GatewaySupervisorPhase = "active" | "buffering" | "disposed" | "teardown";
 export function classifyDiscordGatewayEvent(params: {
   err: unknown;
   isDisallowedIntentsError: (err: unknown) => boolean;
+  isIntentionalAbort?: boolean;
 }): DiscordGatewayEvent {
   const message = String(params.err);
   if (params.isDisallowedIntentsError(params.err)) {
@@ -44,10 +51,10 @@ export function classifyDiscordGatewayEvent(params: {
   }
   if (message.includes("Max reconnect attempts")) {
     return {
-      type: "reconnect-exhausted",
+      type: params.isIntentionalAbort ? "reconnect-aborted" : "reconnect-exhausted",
       err: params.err,
       message,
-      shouldStopLifecycle: true,
+      shouldStopLifecycle: !params.isIntentionalAbort,
     };
   }
   if (message.includes("Fatal Gateway error")) {
@@ -67,12 +74,11 @@ export function classifyDiscordGatewayEvent(params: {
 }
 
 export function createDiscordGatewaySupervisor(params: {
-  client: Client;
+  gateway?: unknown;
   isDisallowedIntentsError: (err: unknown) => boolean;
   runtime: RuntimeEnv;
 }): DiscordGatewaySupervisor {
-  const gateway = params.client.getPlugin("gateway");
-  const emitter = getDiscordGatewayEmitter(gateway);
+  const emitter = getDiscordGatewayEmitter(params.gateway);
   const pending: DiscordGatewayEvent[] = [];
   if (!emitter) {
     return {
@@ -80,37 +86,51 @@ export function createDiscordGatewaySupervisor(params: {
       detachLifecycle: () => {},
       drainPending: () => "continue",
       dispose: () => {},
+      markIntentionalAbort: () => {},
       emitter,
     };
   }
 
   let lifecycleHandler: ((event: DiscordGatewayEvent) => void) | undefined;
   let phase: GatewaySupervisorPhase = "buffering";
-  let disposed = false;
-  const logLateTeardownEvent = (event: DiscordGatewayEvent) => {
-    params.runtime.error?.(
-      danger(
-        `discord: suppressed late gateway ${event.type} error during teardown: ${event.message}`,
-      ),
-    );
-  };
+  let intentionalAbort = false;
+
+  const logLateEvent =
+    (state: Extract<GatewaySupervisorPhase, "disposed" | "teardown">) =>
+    (event: DiscordGatewayEvent) => {
+      params.runtime.error?.(
+        danger(
+          `discord: suppressed late gateway ${event.type} error ${
+            state === "disposed" ? "after dispose" : "during teardown"
+          }: ${event.message}`,
+        ),
+      );
+    };
+
   const onGatewayError = (err: unknown) => {
-    if (disposed) {
-      return;
-    }
     const event = classifyDiscordGatewayEvent({
       err,
       isDisallowedIntentsError: params.isDisallowedIntentsError,
+      isIntentionalAbort: intentionalAbort,
     });
-    if (phase === "active" && lifecycleHandler) {
-      lifecycleHandler(event);
-      return;
+    // Reset after consuming — one abort signal covers one disconnect.
+    if (intentionalAbort && event.type === "reconnect-aborted") {
+      intentionalAbort = false;
     }
-    if (phase === "teardown") {
-      logLateTeardownEvent(event);
-      return;
+    switch (phase) {
+      case "disposed":
+        logLateEvent("disposed")(event);
+        return;
+      case "active":
+        lifecycleHandler?.(event);
+        return;
+      case "teardown":
+        logLateEvent("teardown")(event);
+        return;
+      case "buffering":
+        pending.push(event);
+        return;
     }
-    pending.push(event);
   };
   emitter.on("error", onGatewayError);
 
@@ -138,14 +158,15 @@ export function createDiscordGatewaySupervisor(params: {
       return "continue";
     },
     dispose: () => {
-      if (disposed) {
+      if (phase === "disposed") {
         return;
       }
-      disposed = true;
       lifecycleHandler = undefined;
       phase = "disposed";
       pending.length = 0;
-      emitter.removeListener("error", onGatewayError);
+    },
+    markIntentionalAbort: () => {
+      intentionalAbort = true;
     },
   };
 }
