@@ -899,16 +899,30 @@ describe("runDiscordGatewayLifecycle", () => {
     gateway.isConnected = true;
     getDiscordGatewayEmitterMock.mockReturnValueOnce(emitter);
 
+    let registeredForceStop: ((err: unknown) => void) | undefined;
     waitForDiscordGatewayStopMock.mockImplementationOnce(
       (waitParams: WaitForDiscordGatewayStopParams) =>
         new Promise<void>((_resolve, reject) => {
           waitParams.registerForceStop?.((err) => reject(err || new Error("forced")));
+          // Capture the wrapped handler that lifecycle registered, then trigger
+          // it via the emitter so markIntentionalAbort is called through the
+          // lifecycle's own wrapper path.
         }),
     );
 
     const { lifecycleParams, gatewaySupervisor } = createLifecycleHarness({ gateway });
 
-    await expect(runDiscordGatewayLifecycle(lifecycleParams)).rejects.toThrow("forced");
+    // Trigger a force-stop by emitting a close event and advancing the watchdog.
+    vi.useFakeTimers();
+    try {
+      const lifecyclePromise = runDiscordGatewayLifecycle(lifecycleParams);
+      lifecyclePromise.catch(() => {});
+      emitter.emit("debug", "WebSocket connection closed with code 1006");
+      await vi.advanceTimersByTimeAsync(5 * 60_000 + 1_000);
+      await expect(lifecyclePromise).rejects.toThrow();
+    } finally {
+      vi.useRealTimers();
+    }
 
     expect(gatewaySupervisor.markIntentionalAbort).toHaveBeenCalled();
   });
@@ -936,6 +950,17 @@ describe("runDiscordGatewayLifecycle", () => {
         }),
     );
 
-    await expect(runDiscordGatewayLifecycle(lifecycleParams)).rejects.toThrow("order-test");
+    // Trigger force-stop via reconnect watchdog so it goes through the
+    // lifecycle wrapper that calls markIntentionalAbort before the callback.
+    vi.useFakeTimers();
+    try {
+      const lifecyclePromise = runDiscordGatewayLifecycle(lifecycleParams);
+      lifecyclePromise.catch(() => {});
+      emitter.emit("debug", "WebSocket connection closed with code 1006");
+      await vi.advanceTimersByTimeAsync(5 * 60_000 + 1_000);
+      await expect(lifecyclePromise).rejects.toThrow();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

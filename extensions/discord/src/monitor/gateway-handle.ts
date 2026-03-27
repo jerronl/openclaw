@@ -1,8 +1,31 @@
+import type { EventEmitter } from "node:events";
 import type { GatewayPlugin } from "@buape/carbon/gateway";
 
-/**
- * Alias for GatewayPlugin used within the lifecycle layer.
- * The "Mutable" prefix reflects that the lifecycle may write to internal
- * gateway state (e.g. clearing session/sequence for forced reconnects).
- */
-export type MutableDiscordGateway = GatewayPlugin;
+export type DiscordGatewayHandle = Pick<GatewayPlugin, "disconnect"> & {
+  emitter?: EventEmitter;
+};
+
+type GatewaySocketListener = (...args: unknown[]) => void;
+
+export type DiscordGatewaySocket = {
+  on: (event: "close" | "error", listener: GatewaySocketListener) => unknown;
+  listeners: (event: "close" | "error") => GatewaySocketListener[];
+  removeListener: (event: "close" | "error", listener: GatewaySocketListener) => unknown;
+  terminate?: () => void;
+};
+
+export type MutableDiscordGateway = GatewayPlugin & {
+  emitter?: EventEmitter;
+  options: Record<string, unknown> & {
+    reconnect?: {
+      maxAttempts?: number;
+    };
+  };
+  state?: {
+    sessionId?: string | null;
+    resumeGatewayUrl?: string | null;
+    sequence?: number | null;
+  };
+  sequence?: number | null;
+  ws?: DiscordGatewaySocket | null;
+};
